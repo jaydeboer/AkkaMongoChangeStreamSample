@@ -7,14 +7,13 @@ using Microsoft.Extensions.Hosting;
 using MongoDB.Driver;
 
 // Start up an in-memory MongoDB single node replica set instance so we can test the change stream
-using var mongo = EphemeralMongo.MongoRunner.Run(new EphemeralMongo.MongoRunnerOptions { UseSingleNodeReplicaSet = true, });
+using var mongo = EphemeralMongo.MongoRunner.Run(new EphemeralMongo.MongoRunnerOptions { UseSingleNodeReplicaSet = true, KillMongoProcessesWhenCurrentProcessExits = true });
 var cs = mongo.ConnectionString;
 var withDb = cs.Substring(0, cs.LastIndexOf('/') + 1) + "AkkaPersistence" + cs.Substring(cs.LastIndexOf('/') + 1);
 
 var builder = Host.CreateApplicationBuilder(args);
 
 var journalOptions = new MongoDbJournalOptions() { ConnectionString = withDb, AutoInitialize = true, LegacySerialization = false };
-Console.WriteLine(journalOptions);
 
 builder.Services.AddAkka("MyActorSystem", configurationBuilder =>
 {
@@ -31,5 +30,5 @@ builder.Services.AddAkka("MyActorSystem", configurationBuilder =>
 
 var app = builder.Build();
 
-Console.WriteLine("Mongo is available at {0}", withDb);
+Console.WriteLine("****** Mongo is available at {0}", withDb);
 app.Run();
