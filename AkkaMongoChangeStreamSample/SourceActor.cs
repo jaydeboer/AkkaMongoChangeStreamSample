@@ -9,7 +9,7 @@ public class SourceActor : ReceivePersistentActor, IWithTimers
     public SourceActor()
     {
         PersistenceId = "source-actor";
-        Command<string>(s => Persist(s, _ => { SendDelayedMessage(); }));
+        Command<string>(s => Persist(new MyEvent(s), _ => { SendDelayedMessage(); }));
         SendDelayedMessage();
     }
 
@@ -23,3 +23,6 @@ public class SourceActor : ReceivePersistentActor, IWithTimers
 
     private Faker Faker { get; } = new Faker();
 }
+
+
+internal record MyEvent(string Data);

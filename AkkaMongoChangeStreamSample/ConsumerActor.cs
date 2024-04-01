@@ -1,4 +1,5 @@
-﻿using Akka.Actor;
+﻿using System.Reactive.Linq;
+using Akka.Actor;
 using Akka.Event;
 using Akka.Persistence;
 using Akka.Persistence.MongoDb.Journal;
@@ -12,31 +13,24 @@ using MongoDB.Driver;
 
 namespace AkkaMongoChangeStreamSample;
 
-public class ConsumerActor : ReceiveActor, IWithTimers
+public class ConsumerActor : ReceivePersistentActor, IWithTimers
 {
     public ConsumerActor(IMongoCollection<JournalEntry> journalCollection)
     {
         _journalCollection = journalCollection;
         _serializer = Context.System.Serialization.FindSerializerForType(typeof(Persistent));
-        Receive<StartConsuming>(_ => Consume());
-        Receive<EventEnvelope>(ee => ee.Event is string, ee => Console.WriteLine($"ConsumerActor received: {ee.Event}"));
+        Command<StartConsuming>(_ => Consume());
+        Command<EventEnvelope>(ee => ee.Event is MyEvent, ee => Console.WriteLine($"ConsumerActor received: {(ee.Event as MyEvent)?.Data}"));
 
         Timers.StartSingleTimer("key", StartConsuming.Instance, TimeSpan.FromSeconds(3));
-
-        Receive<ExpectedEndOfStreamEvent>(_ =>
-        {
-            _log.Info("End of persistence query reached, switching to change stream");
-            StartMessageProductionFromChangeStream();
-        });
     }
     public ITimerScheduler Timers { get; set; } = null!;
+    public override string PersistenceId { get; } = "consumer-actor";
 
     public override void AroundPostStop()
     {
         if (_cts.IsCancellationRequested == false)
             _cts.Cancel();
-        _cursor?.Dispose();
-        _runner?.Wait();
 
         base.AroundPostStop();
     }
@@ -49,7 +43,29 @@ public class ConsumerActor : ReceiveActor, IWithTimers
         var materializer = Context.Materializer();
         _self = Self;
         var eventsByTag = readJournal.CurrentEventsByPersistenceId("source-actor", 0, long.MaxValue);
-        eventsByTag.RunWith(Sink.ActorRef<EventEnvelope>(
+
+        var observable = Observable.Create<EventEnvelope>(async (obs, token) =>
+        {
+            var pipeline = new EmptyPipelineDefinition<ChangeStreamDocument<JournalEntry>>()
+                .Match(change => change.FullDocument.PersistenceId == "source-actor");
+
+            using var cursor = _journalCollection.Watch(pipeline, cancellationToken: token);
+
+            while (await cursor.MoveNextAsync(token))
+            {
+                foreach (var change in cursor.Current)
+                {
+                    var persistent = ToPersistenceRepresentation(change.FullDocument);
+                    var ee = new EventEnvelope(Offset.Sequence(change.FullDocument.Ordering.Value),
+                        persistent.PersistenceId, persistent.SequenceNr, persistent.Payload, persistent.Timestamp,
+                        change.FullDocument.Tags?.ToArray() ?? []);
+                    obs.OnNext(ee);
+                }
+            }
+        });
+
+        var changeStreamSource = Source.FromObservable(observable);
+        eventsByTag.Concat(changeStreamSource).RunWith(Sink.ActorRef<EventEnvelope>(
                 _self,
                 ExpectedEndOfStreamEvent.Instance,
                 ex =>
@@ -57,60 +73,12 @@ public class ConsumerActor : ReceiveActor, IWithTimers
                     _log.Info(ex.Message);
                     return ex;
                 }), materializer);
-        StartWatch(ex => throw ex);
-    }
-
-    private void StartWatch(Action<Exception> onError)
-    {
-        // This pipeline will only match documents that have the given tag
-        //var pipeline = new EmptyPipelineDefinition<ChangeStreamDocument<JournalEntry>>()
-        //    .Match(change => change.FullDocument.Tags.Any(t => t == tag));
-
-        var pipeline = new EmptyPipelineDefinition<ChangeStreamDocument<JournalEntry>>()
-            .Match(change => change.FullDocument.PersistenceId == "source-actor");
-
-        _cursor = _journalCollection.Watch(pipeline, cancellationToken: _cts.Token);
-        _onError = onError;
-    }
-
-    public void StartMessageProductionFromChangeStream()
-    {
-        _runner = Task.Run(ProduceMessages);
-    }
-
-    private async Task ProduceMessages()
-    {
-        try
-        {
-            while (_cts.Token.IsCancellationRequested == false)
-            {
-                await _cursor.ForEachAsync(change =>
-                {
-                    var persistent = ToPersistenceRepresentation(change.FullDocument);
-                    var ee = new EventEnvelope(Offset.Sequence(change.FullDocument.Ordering.Value),
-                        persistent.PersistenceId, persistent.SequenceNr, persistent.Payload, persistent.Timestamp,
-                        change.FullDocument.Tags.ToArray());
-                    _self?.Tell(ee, ActorRefs.NoSender);
-                }, _cts.Token);
-            }
-        }
-        catch (TaskCanceledException)
-        {
-            // ignore
-        }
-        catch (Exception ex)
-        {
-            _onError?.Invoke(ex);
-        }
     }
 
     private static readonly BsonTimestamp ZeroTimestamp = new(0);
     private readonly Serializer _serializer;
-    private Task? _runner;
     private readonly CancellationTokenSource _cts = new();
-    private IChangeStreamCursor<ChangeStreamDocument<JournalEntry>>? _cursor;
     private IActorRef? _self;
-    private Action<Exception>? _onError;
     private IMongoCollection<JournalEntry> _journalCollection;
 
 
